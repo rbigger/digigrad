@@ -70,6 +70,7 @@ from fastapi.responses import PlainTextResponse
 from . import email_inbox
 from . import memory as memory_mod
 from . import db as db_mod
+from . import places
 from . import tenants
 from . import websearch
 from .business_agent import (
@@ -327,13 +328,49 @@ def _place_call_tool_def() -> Any:
     )
 
 
+def _find_business_tool_def() -> Any:
+    """Structured business lookup (Google Places) — returns a dialable phone.
+
+    web_search (Linkup) finds *which* business but rarely a usable number;
+    Places returns a verified internationalPhoneNumber, so this is what feeds
+    place_call for the find-and-call flow."""
+    return gradbot.ToolDef(
+        name="find_business",
+        description=(
+            "Look up a real business and its VERIFIED phone number to call. Use this "
+            "(NOT web_search) whenever the caller wants you to call a place — e.g. "
+            "'find a cafe near my hotel and call the best one'. Returns a ranked list "
+            "of candidates (name, rating, address, phone in E.164), best first. Pick the "
+            "top-rated one that has a phone and pass that phone straight to place_call. "
+            "Do NOT use web_search to find phone numbers — its numbers are unreliable."
+        ),
+        parameters_json=json.dumps({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "What to find, with the area/landmark — e.g. 'highly rated cafe "
+                        "near Hotel Carlton, Sutter Street, San Francisco'."
+                    ),
+                },
+            },
+            "required": ["query"],
+        }),
+    )
+
+
 def _assistant_tool_defs() -> list[Any]:
     """Tools for assistant mode (free personal call): email + memory + web +
-    place outbound call + hang up."""
+    business lookup + place outbound call + hang up."""
     if not HAS_GRADBOT:
         return []
-    return _memory_tool_defs() + [
+    tools = _memory_tool_defs() + [
         _web_search_tool_def(),
+    ]
+    if places.available():
+        tools.append(_find_business_tool_def())
+    tools += [
         _place_call_tool_def(),
         gradbot.ToolDef(
             name="get_email_summary",
@@ -353,6 +390,7 @@ def _assistant_tool_defs() -> list[Any]:
         ),
         _hang_up_tool_def(),
     ]
+    return tools
 
 
 def _receptionist_tool_defs() -> list[Any]:
@@ -554,6 +592,7 @@ def _timeline_event(state: _CallState, name: str, **extra: object) -> None:
         "business_prompt_build": "system",
         "email_summary": "tool_call",
         "web_search": "tool_call",
+        "find_business": "tool_call",
         "place_call": "tool_call",
         "take_message": "tool_call",
         "remember": "tool_call",
@@ -1000,6 +1039,39 @@ async def _handle_tool_call(handle, state: _CallState, send_event) -> None:
             payload = {"answer": result["answer"], "sources": result["sources"]}
             state.search_cache[key] = (time.monotonic(), payload)
             await handle.send_json(payload)
+        return
+
+    if name == "find_business":
+        query = (args.get("query") or "").strip()
+        if not query:
+            await handle.send_error("Refused: empty query — say what business to find.")
+            return
+        log.info("call %s | find_business query=%r", state.room_name, query)
+        t0 = time.time()
+        try:
+            results = await asyncio.wait_for(
+                asyncio.to_thread(places.find_businesses, query), timeout=8.0
+            )
+        except asyncio.TimeoutError:
+            log.warning("call %s | find_business TIMEOUT query=%r", state.room_name, query)
+            _timeline_event(state, "find_business", query=query[:120], error="timeout")
+            await handle.send_json({"error": "The lookup took too long — tell the caller you couldn't pull it up."})
+            return
+        except places.PlacesNotConfigured:
+            log.warning("call %s | find_business not configured (GOOGLE_PLACES_API_KEY missing)", state.room_name)
+            _timeline_event(state, "find_business", error="not_configured")
+            await handle.send_json({"error": "Business lookup isn't set up.", "configured": False})
+            return
+        except places.PlacesError as exc:
+            log.warning("call %s | find_business FAILED query=%r: %s", state.room_name, query, exc)
+            _timeline_event(state, "find_business", query=query[:120], error="failed")
+            await handle.send_json({"error": "Couldn't look that up right now."})
+            return
+        n_with_phone = sum(1 for r in results if r.get("phone"))
+        log.info("call %s | find_business OK in %.1fs results=%d with_phone=%d query=%r",
+                 state.room_name, time.time() - t0, len(results), n_with_phone, query)
+        _timeline_event(state, "find_business", query=query[:120], results=len(results), with_phone=n_with_phone)
+        await handle.send_json({"results": results})
         return
 
     if name == "take_message":
