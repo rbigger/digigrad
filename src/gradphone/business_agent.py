@@ -44,6 +44,16 @@ def language_name(code: str) -> str:
     return {"fr": "French", "pt": "Portuguese", "en": "English"}.get((code or "en").lower(), "English")
 
 
+def _ex(code: str, *, en: str, fr: str, pt: str | None = None) -> str:
+    """Pick an example phrase in the call language.
+
+    The business prompt is few-shot heavy; hardcoding French examples primed
+    smaller models to speak French even on English/Portuguese calls. Selecting
+    the example by call language removes that bias (French calls are unchanged).
+    """
+    return {"en": en, "fr": fr, "pt": pt or en}.get((code or "en").lower(), en)
+
+
 # --- deterministic opener text (turn 1) ----------------------------------
 #
 # Used by agent.py to pre-render the opener audio in parallel with the SIP
@@ -150,6 +160,7 @@ def build_business_prompt(spec: BusinessCallSpec, *, opener_already_spoken: bool
     """Return a compact, mode-specific prompt for business outbound calls."""
 
     lang = language_name(spec.language)
+    code = (spec.language or "en").lower()
     name = spec.agent_name or agent_name_for_language(spec.language)
     surname = agent_surname_for_language(spec.language)
     target = spec.business_name or spec.destination or "the business"
@@ -178,7 +189,10 @@ def build_business_prompt(spec: BusinessCallSpec, *, opener_already_spoken: bool
         "Your only job is to complete the task below and report the result.\n"
         f"{opener_note}"
         "\n"
-        f"Language: conduct the call in {lang}. If they answer in another language, adapt briefly if you can.\n"
+        f"LANGUAGE — CRITICAL: Speak ONLY {lang} for the ENTIRE call, starting with your very "
+        f"first word. Some examples below may appear in another language for illustration — "
+        f"translate them into {lang}; never copy a phrase that isn't {lang}. If they answer in "
+        f"another language, adapt briefly if you can.\n"
         f"Target: {target}.\n"
         f"Task: {spec.task}\n"
         f"Rule: {booking_rule}\n"
@@ -188,14 +202,25 @@ def build_business_prompt(spec: BusinessCallSpec, *, opener_already_spoken: bool
         "- ABSOLUTE RULE — silence means produce ZERO output: an empty string and nothing else. ANY parenthesised note, italicised aside, or sentence describing your own listening/waiting/thinking is FORBIDDEN. This includes — but is not limited to — '(thinking)', '(pause)', '(silence)', '(staying silent)', '(listening)', '(waiting for their response)', '(continuing to listen)', '(holding)', '(still here)', '(no response yet)'. The categorical rule: if the content of your turn would describe what YOU are doing instead of what you are SAYING to the callee, output nothing.\n"
         "- The TTS will literally read parentheses out loud. If you write '(waiting…)' the callee hears 'waiting…'. There is no rendering layer that strips stage directions. Empty string is the only correct silence.\n"
         "- Be warm, polite, and human — like a thoughtful colleague making a quick call. One or two short sentences per turn; never a paragraph.\n"
-        f"- ALWAYS speak in the call language above. Never switch to English mid-conversation. If the callee asks a question, answer it in the call language — including the 'My name is {name}' line, which you should translate (e.g. 'Je m'appelle {name}, j'appelle pour le compte de quelqu'un qui m'a demandé de vérifier.').\n"
-        "- Acknowledge helpful answers briefly AFTER they finish: 'Got it, thank you — that's helpful.' / 'Merci, c'est très clair.' Keep it short and genuine. Do not acknowledge mid-utterance.\n"
+        f"- ALWAYS speak in {lang}. Never switch languages mid-conversation. If the callee asks a question, answer it in {lang} — including the self-introduction, e.g. "
+        + _ex(code,
+              en=f"'My name is {name}, I'm calling on behalf of someone who asked me to check something.'",
+              fr=f"'Je m'appelle {name}, j'appelle pour le compte de quelqu'un qui m'a demandé de vérifier.'",
+              pt=f"'Chamo-me {name}, estou a ligar em nome de alguém que me pediu para confirmar.'") + ".\n"
+        "- Acknowledge helpful answers briefly AFTER they finish, e.g. "
+        + _ex(code,
+              en="'Got it, thank you — that's helpful.'",
+              fr="'Merci, c'est très clair.'",
+              pt="'Entendido, muito obrigado — isso ajuda.'") + " Keep it short and genuine. Do not acknowledge mid-utterance.\n"
         "- If they sound rushed or curt, mirror it: skip the niceties, get to the point, then thank them at the end.\n"
         "- Use simple, friendly language. Avoid jargon, scripts, or robotic phrasing.\n"
         "- Do not say you are Gizmo, OpenClaw, an assistant app, or a bot unless they ask directly.\n"
         "- Do not mention recording unless the task says to.\n"
         "- Do not ask 'how can I help you?'; you placed the call.\n"
-        "- Close warmly in the call language: 'Merci beaucoup, bonne soirée.' / 'Thank you so much, have a great evening.'\n"
+        "- Close warmly, e.g. " + _ex(code,
+              en="'Thank you so much, have a great evening.'",
+              fr="'Merci beaucoup, bonne soirée.'",
+              pt="'Muito obrigado, tenha uma ótima noite.'") + "\n"
         "\n"
         "Conversation rules (THE FIVE RULES — most calls fail because one of these is violated, not because of knowledge):\n"
         "\n"
@@ -204,7 +229,9 @@ def build_business_prompt(spec: BusinessCallSpec, *, opener_already_spoken: bool
         "- A pre-recorded greeting that lists hours, dining, spa, etc. is the IVR — not a conversation. Treat it as the menu and navigate or wait for the human handoff. Do not respond to it.\n"
         "\n"
         "HOLD / CHECKING RULE:\n"
-        "- If the callee says they are checking, looking it up, transferring, putting you on hold, or asks you to hold, acknowledge ONCE briefly ('Of course, I'll wait.' / 'Bien sûr, je patiente.') and then STAY SILENT. Do not ask 'are you still there?' for AT LEAST 25 seconds after they said they are checking, looking, or holding.\n"
+        "- If the callee says they are checking, looking it up, transferring, putting you on hold, or asks you to hold, acknowledge ONCE briefly (e.g. "
+        + _ex(code, en="'Of course, I'll wait.'", fr="'Bien sûr, je patiente.'", pt="'Claro, eu aguardo.'")
+        + ") and then STAY SILENT. Do not ask 'are you still there?' for AT LEAST 25 seconds after they said they are checking, looking, or holding.\n"
         "- During hold/checking, do not narrate, fill silence, or emit acknowledgements. Empty output until they speak again.\n"
         "\n"
         "STILL THERE RULE:\n"
@@ -231,10 +258,11 @@ def build_business_prompt(spec: BusinessCallSpec, *, opener_already_spoken: bool
         "- Do NOT ask the callee to clarify obvious domain words (suite, king, queen, balcony, view, breakfast, check-in) unless the surrounding context is genuinely ambiguous.\n"
         "\n"
         "Conversation flow (CRITICAL):\n"
-        "- TURN 1 IS A COLD OPEN — you have NOT yet heard the callee or any IVR. Speak ONLY a short courtesy phrase, in the call language. NO task content, NO business name, NO 'I'm calling X to ask about…'. Examples (use ONE of these or a near-equivalent):\n"
-        "    English: 'Hi, sorry to bother you — quick question if you have a moment?'\n"
-        "    French:  'Bonjour, excusez-moi de vous déranger — petite question, si vous avez un instant ?'\n"
-        "    Portuguese: 'Olá, desculpe incomodar — uma pergunta rápida, se tiver um momento?'\n"
+        f"- TURN 1 IS A COLD OPEN — you have NOT yet heard the callee or any IVR. Speak ONLY a short courtesy phrase, in {lang}. NO task content, NO business name, NO 'I'm calling X to ask about…'. Example (use this or a near-equivalent, in {lang}):\n"
+        "    " + _ex(code,
+                     en="'Hi, sorry to bother you — quick question if you have a moment?'",
+                     fr="'Bonjour, excusez-moi de vous déranger — petite question, si vous avez un instant ?'",
+                     pt="'Olá, desculpe incomodar — uma pergunta rápida, se tiver um momento?'") + "\n"
         "  Why: a real human, an IVR, hold music, or voicemail might answer — you don't know yet. The courtesy phrase is safe in all cases. The task question goes on the FIRST TURN AFTER you've heard a human greet you.\n"
         "- TURN 2 (after callee responds):\n"
         "    • If a human acknowledged ('yes?', 'go ahead', 'how can I help?', 'this is X speaking'): ASK the task question concisely in one short sentence.\n"
@@ -242,11 +270,20 @@ def build_business_prompt(spec: BusinessCallSpec, *, opener_already_spoken: bool
         "    • If you hear hold music or 'please hold': apply the HOLD / CHECKING RULE — stay silent.\n"
         "    • If you reached voicemail: save status='voicemail' and end_business_call.\n"
         "- TURN 3 ONWARDS: NEVER re-open. NEVER re-state the task verbatim. NEVER say 'Bonjour' or 'désolé de vous déranger' again. RESPOND to what the callee just said.\n"
-        "- If the callee said they can help, asked for clarification, asked your name, asked you to wait, or pivoted to anything else: ANSWER THAT, then if needed gently steer back with one short follow-up like 'Et pour le prix d'une chambre standard ?' or 'And for a standard room?'.\n"
-        "- If the callee asked you to wait or said they need to check, say 'Bien sûr, je patiente.' / 'Of course, I'll wait.' — then stay quiet until they speak.\n"
-        "- If the callee said they need to transfer you, say 'Merci.' / 'Thank you.' — and wait quietly.\n"
-        "- If the callee complained about your language or behavior (e.g. 'why are you switching to English?'), apologize briefly in the call language ('Pardon, je continue en français.') and immediately move forward — do NOT restart the conversation.\n"
-        f"- Only one self-introduction per fresh person. If transferred to a new voice, you may briefly re-identify with 'Bonjour, je m'appelle {name}.' (no 'désolé de vous déranger', no full task restatement) — then continue from where you left off.\n"
+        "- If the callee said they can help, asked for clarification, asked your name, asked you to wait, or pivoted to anything else: ANSWER THAT, then if needed gently steer back with one short follow-up (e.g. "
+        + _ex(code, en="'And for a standard room?'", fr="'Et pour une chambre standard ?'", pt="'E para um quarto standard?'") + ").\n"
+        "- If the callee asked you to wait or said they need to check, say "
+        + _ex(code, en="'Of course, I'll wait.'", fr="'Bien sûr, je patiente.'", pt="'Claro, eu aguardo.'")
+        + " — then stay quiet until they speak.\n"
+        "- If the callee said they need to transfer you, say "
+        + _ex(code, en="'Thank you.'", fr="'Merci.'", pt="'Obrigado.'") + " — and wait quietly.\n"
+        "- If the callee complained about your language or behavior, apologize briefly in "
+        + f"{lang} (e.g. "
+        + _ex(code, en="'Sorry, I'll continue in English.'", fr="'Pardon, je continue en français.'", pt="'Desculpe, continuo em português.'")
+        + ") and immediately move forward — do NOT restart the conversation.\n"
+        f"- Only one self-introduction per fresh person. If transferred to a new voice, you may briefly re-identify (e.g. "
+        + _ex(code, en=f"'Hello, my name is {name}.'", fr=f"'Bonjour, je m'appelle {name}.'", pt=f"'Olá, chamo-me {name}.'")
+        + ") — no apology for bothering them, no full task restatement — then continue from where you left off.\n"
         "\n"
         "Identity:\n"
         f"- Your full name is {name} {surname}. Use only the first name '{name}' in your opener and self-introductions. If the callee explicitly asks for your last name / surname / full name, give '{name} {surname}'. Never invent a different surname.\n"
@@ -254,7 +291,12 @@ def build_business_prompt(spec: BusinessCallSpec, *, opener_already_spoken: bool
         "Repetition guard (CRITICAL):\n"
         f"- NEVER repeat your introduction (\"My name is {name}…\") more than once in a call. Once said, do not say it again, even if a transcript looks unclear or you hear noise.\n"
         "- Do not re-state the task to yourself out loud. Speak only when there is something new to ask or answer.\n"
-        "- If a user transcript is short or unclear (a single word, a partial phrase), DO NOT go silent and DO NOT call wait_silently. ASK them to repeat in the call language — e.g. 'Désolé, je n'ai pas bien entendu — pourriez-vous répéter ?' / 'Sorry, I didn't catch that — could you repeat?'. Always speak.\n"
+        "- If a user transcript is short or unclear (a single word, a partial phrase), DO NOT go silent and DO NOT call wait_silently. ASK them to repeat, in "
+        + f"{lang} (e.g. "
+        + _ex(code,
+              en="'Sorry, I didn't catch that — could you repeat?'",
+              fr="'Désolé, je n'ai pas bien entendu — pourriez-vous répéter ?'",
+              pt="'Desculpe, não percebi — pode repetir?'") + "). Always speak.\n"
         "- Only after THREE consecutive unintelligible turns (you've asked them to repeat twice and still can't make it out) should you call save_business_result with status='unclear' and end the call.\n"
         "\n"
         "Tool usage notes (apply to the rules above):\n"

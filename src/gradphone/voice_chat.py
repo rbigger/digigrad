@@ -20,10 +20,11 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
+import re
 
 import aiohttp
 
+from . import audio_io
 from . import memory as memory_mod
 from . import websearch
 from .business_agent import language_name
@@ -35,34 +36,6 @@ _MAX_HISTORY_TURNS = 12  # rolling user+assistant messages kept for context
 _LLM_TIMEOUT = 30
 _MAX_TOOL_ROUNDS = 3  # cap web_search → LLM round-trips per reply
 _WEB_SEARCH_TIMEOUT = 10.0  # seconds for one Linkup call
-
-
-def _ffmpeg(args: list[str], stdin: bytes) -> bytes:
-    """Run ffmpeg with bytes in/out via temp files (small clips; robust)."""
-    proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", *args],
-        input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode('utf-8', 'replace')[:300]}")
-    return proc.stdout
-
-
-def _ogg_to_pcm16(ogg: bytes) -> bytes:
-    """Telegram voice (OGG/Opus) → raw little-endian PCM16 mono @ 24 kHz."""
-    return _ffmpeg(
-        ["-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le",
-         "-ac", "1", "-ar", str(_STT_SAMPLE_RATE), "pipe:1"],
-        ogg,
-    )
-
-
-def _wav_to_ogg_opus(wav: bytes) -> bytes:
-    """Gradium TTS WAV → OGG/Opus for Telegram's reply_voice."""
-    return _ffmpeg(
-        ["-i", "pipe:0", "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "pipe:1"],
-        wav,
-    )
 
 
 def _gradium_client():
@@ -82,7 +55,7 @@ async def transcribe(ogg_bytes: bytes) -> str:
     import gradium
     import numpy as np
 
-    pcm = await asyncio.to_thread(_ogg_to_pcm16, ogg_bytes)
+    pcm = await asyncio.to_thread(audio_io.ogg_to_pcm16, ogg_bytes, _STT_SAMPLE_RATE)
     samples = np.frombuffer(pcm, dtype=np.int16)
     client = _gradium_client()
     setup = gradium.STTSetup(model_name="default", input_format="pcm")
@@ -100,7 +73,7 @@ async def synthesize(text: str, voice_id: str) -> bytes:
     wav = getattr(result, "raw_data", None)
     if not wav:
         raise RuntimeError("Gradium TTS returned no audio")
-    return await asyncio.to_thread(_wav_to_ogg_opus, wav)
+    return await asyncio.to_thread(audio_io.wav_to_ogg_opus, wav)
 
 
 def _system_prompt(
@@ -236,7 +209,14 @@ async def _chat(messages: list[dict], tools: list[dict] | None = None,
         ) as r:
             r.raise_for_status()
             data = await r.json()
-    return data["choices"][0]["message"]
+    # An OpenAI-compatible endpoint can return an error/quota body (or an
+    # empty choices list) with a 2xx — guard before indexing so a bad
+    # response surfaces as a handled error, not a KeyError/IndexError that
+    # kills the whole voice reply.
+    choices = (data or {}).get("choices") or []
+    if not choices:
+        raise RuntimeError(f"LLM returned no choices: {str(data)[:300]}")
+    return choices[0]["message"]
 
 
 async def _complete_with_tools(messages: list[dict], tools: list[dict] | None,
@@ -313,3 +293,92 @@ async def learn_from_exchange(tenant_id: int, user_text: str, reply_text: str) -
     return await memory_mod.extract_and_store(
         tenant_id, [("caller", user_text), ("agent", reply_text)], room="telegram-voice"
     )
+
+
+# Intents the Telegram bot can route a typed message to (besides plain chat).
+# Each maps to an existing command handler in bot.py.
+INTENTS = ("translate", "callme", "call", "history", "status", "voice", "clear_voice", "web", "chat")
+
+_INTENT_SYSTEM = (
+    "You are the intent router for a personal voice-assistant Telegram bot. "
+    "Read the user's message and reply with EXACTLY ONE word from this list, "
+    "nothing else:\n"
+    "- translate: they want to translate an audio clip / voice note into another language.\n"
+    "- callme: they want the assistant to phone THEM.\n"
+    "- call: they want to place an outbound call to someone or a business.\n"
+    "- history: they want to see their past or recent calls.\n"
+    "- status: they want to see calls currently live / in progress.\n"
+    "- voice: they're asking about their cloned-voice status.\n"
+    "- clear_voice: they want to remove or re-clone their voice.\n"
+    "- web: they want the web dashboard link.\n"
+    "- chat: ANYTHING else — normal conversation, questions, or requests to "
+    "write/explain/summarize/etc.\n"
+    "When in doubt, answer chat."
+)
+
+
+async def classify_intent(text: str) -> str:
+    """Map a typed message to one bot intent (see INTENTS), defaulting to 'chat'.
+
+    Best-effort: any LLM error or unrecognized output falls back to 'chat' so
+    normal conversation always works even if routing misfires.
+    """
+    text = (text or "").strip()
+    if not text:
+        return "chat"
+    try:
+        msg = await _chat(
+            [{"role": "system", "content": _INTENT_SYSTEM},
+             {"role": "user", "content": text}],
+            max_tokens=4,
+        )
+        raw = (msg.get("content") or "").strip().lower()
+        tokens = re.findall(r"[a-z_]+", raw)
+        word = tokens[0] if tokens else ""
+        return word if word in INTENTS else "chat"
+    except Exception:  # noqa: BLE001 - routing must never break chat
+        log.warning("intent classify failed; defaulting to chat", exc_info=True)
+        return "chat"
+
+
+_CALL_LANGS = ("en", "fr", "pt")
+
+_CALL_PARSE_SYSTEM = (
+    "Extract outbound-call details from the user's request. Reply with ONLY a "
+    "JSON object (no prose, no code fences) with these keys:\n"
+    '  "to": the phone number in E.164 form (e.g. "+33618286290"), or "" if none is given.\n'
+    '  "task": a short instruction describing what to say on the call, in the third '
+    'person (e.g. "Let them know I will be 20 minutes late for dinner").\n'
+    '  "language": one of en, fr, pt — the language to speak on the call; default '
+    '"en" unless the request clearly implies another.\n'
+    'Example → {"to": "+33618286290", "task": "Let them know I will be late for dinner", "language": "en"}'
+)
+
+
+async def parse_call_request(text: str) -> dict:
+    """Extract {to, task, language} from a natural-language call request.
+
+    Returns {} if no usable phone number is found or on any error, so the caller
+    can fall back to asking for it explicitly.
+    """
+    try:
+        msg = await _chat(
+            [{"role": "system", "content": _CALL_PARSE_SYSTEM},
+             {"role": "user", "content": text or ""}],
+            max_tokens=120,
+        )
+        content = (msg.get("content") or "").strip()
+        m = re.search(r"\{.*\}", content, re.S)  # tolerate stray fences/prose
+        data = json.loads(m.group(0)) if m else {}
+    except Exception:  # noqa: BLE001
+        log.warning("call-request parse failed", exc_info=True)
+        return {}
+    to = "+" + "".join(ch for ch in str(data.get("to", "")) if ch.isdigit())
+    if to == "+":
+        return {}
+    lang = str(data.get("language") or "en").strip().lower()
+    return {
+        "to": to,
+        "task": str(data.get("task") or "").strip(),
+        "language": lang if lang in _CALL_LANGS else "en",
+    }
