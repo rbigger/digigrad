@@ -90,6 +90,33 @@ async def _fetch_tenant(telegram_id: int) -> Optional[dict]:
     return data.get("tenant")
 
 
+class _BridgeDown(Exception):
+    """The bridge couldn't be reached or returned an unusable response."""
+
+
+async def _bridge_json(method: str, path: str, **kw) -> dict:
+    """Call the bridge and return parsed JSON, or raise _BridgeDown.
+
+    Centralizes the failure handling the command handlers need: network
+    errors, timeouts, 5xx, and non-JSON bodies all become _BridgeDown so a
+    handler can show "couldn't reach the bridge" instead of crashing.
+    """
+    kw.setdefault("headers", _auth_headers())
+    kw.setdefault("timeout", aiohttp.ClientTimeout(total=10))
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.request(method, f"{_bridge_url()}{path}", **kw) as r:
+                if r.status >= 500:
+                    raise _BridgeDown(f"bridge returned HTTP {r.status}")
+                return await r.json()
+    except _BridgeDown:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        raise _BridgeDown(f"network error: {e}") from e
+    except ValueError as e:  # non-JSON body (json.JSONDecodeError ⊂ ValueError)
+        raise _BridgeDown(f"unexpected response: {e}") from e
+
+
 # ─── Command handlers ────────────────────────────────────
 
 async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -141,14 +168,16 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     name = user.full_name or user.username or f"user_{user.id}"
-    async with aiohttp.ClientSession() as sess:
-        async with sess.post(
-            f"{_bridge_url()}/tenants",
-            json={"telegram_id": user.id, "name": name},
-            headers=_auth_headers(),
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as r:
-            data = await r.json()
+    try:
+        data = await _bridge_json(
+            "POST", "/tenants", json={"telegram_id": user.id, "name": name},
+        )
+    except _BridgeDown as e:
+        log.warning("register: %s", e)
+        await update.message.reply_text(
+            "Couldn't reach the bridge — make sure it's running, then try /register again."
+        )
+        return
     if not data.get("ok"):
         await update.message.reply_text(f"Registration failed: {data.get('error', 'unknown')}")
         return
@@ -457,14 +486,14 @@ async def history(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not tenant:
         await update.message.reply_text("Run /register first.")
         return
-    async with aiohttp.ClientSession() as sess:
-        async with sess.get(
-            f"{_bridge_url()}/history/{tenant['id']}",
-            params={"limit": MAX_HISTORY_DISPLAYED},
-            headers=_auth_headers(),
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as r:
-            data = await r.json()
+    try:
+        data = await _bridge_json(
+            "GET", f"/history/{tenant['id']}", params={"limit": MAX_HISTORY_DISPLAYED},
+        )
+    except _BridgeDown as e:
+        log.warning("history: %s", e)
+        await update.message.reply_text("Couldn't reach the bridge to load your history.")
+        return
     rows = data.get("calls") or []
     if not rows:
         await update.message.reply_text("No calls yet. /call to place one.")
@@ -639,14 +668,141 @@ async def voice_chat_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         log.warning("voice chat: memory growth failed: %s", e)
 
 
+async def _route_intent(intent: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Run the existing handler for a natural-language intent. Returns True if
+    the message was handled as a command (so the caller skips plain chat)."""
+    if intent == "translate":
+        await translate(update, context)
+    elif intent == "callme":
+        await callme(update, context)
+    elif intent == "history":
+        await history(update, context)
+    elif intent == "status":
+        await status(update, context)
+    elif intent == "voice":
+        await voice_status(update, context)
+    elif intent == "clear_voice":
+        await clear_voice(update, context)
+    elif intent == "web":
+        await web(update, context)
+    elif intent == "call":
+        await _start_oneshot_call(update, context)
+    else:
+        return False
+    return True
+
+
+async def _start_oneshot_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Natural-language outbound call: parse the number + message from the
+    request and ask for one tap to confirm before dialing (a misparse must not
+    silently place a real call)."""
+    msg = update.effective_message
+    user = update.effective_user
+    tenant = await _fetch_tenant(user.id) if user else None
+    if not tenant:
+        await msg.reply_text("Run /register first.")
+        return
+    parsed = await _voice_chat.parse_call_request(msg.text or "")
+    if not parsed.get("to"):
+        await msg.reply_text(
+            "Sure — what number should I call? Say it all at once, e.g. "
+            "\"call +1 555 123 4567 and tell them I'm running late\", or use /call."
+        )
+        return
+    context.user_data["pending_oscall"] = {**parsed, "tenant_id": tenant["id"]}
+    text, kb = _oscall_card(context.user_data["pending_oscall"])
+    await msg.reply_text(text, reply_markup=kb)
+
+
+# Languages the outbound call can be placed in (match business_agent support).
+_CALL_LANG_LABELS = {"en": "English", "fr": "French", "pt": "Português"}
+
+
+def _oscall_card(pending: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """Render the one-shot call confirmation: details + a language row (current
+    one ticked, tap to change) + Place/Cancel."""
+    lang = pending.get("language", "en")
+    task = pending.get("task") or "(no message — I'll just introduce the call)"
+    lang_row = [
+        InlineKeyboardButton(
+            ("✅ " if code == lang else "") + label,
+            callback_data=f"oscall:lang:{code}",
+        )
+        for code, label in _CALL_LANG_LABELS.items()
+    ]
+    kb = InlineKeyboardMarkup([
+        lang_row,
+        [InlineKeyboardButton("📞 Place call", callback_data="oscall:yes"),
+         InlineKeyboardButton("Cancel", callback_data="oscall:no")],
+    ])
+    text = (
+        f"Ready to call:\n"
+        f"• To: {pending['to']}\n"
+        f"• Language: {_CALL_LANG_LABELS.get(lang, lang)}  (tap below to change)\n"
+        f"• Message: {task}"
+    )
+    return text, kb
+
+
+async def oscall_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirm/cancel a natural-language one-shot call, then dial + report —
+    mirrors the /call ConversationHandler's confirm step."""
+    query = update.callback_query
+    await query.answer()
+    # Language switch: update the pending call and re-render the card; don't dial.
+    if query.data.startswith("oscall:lang:"):
+        pending = context.user_data.get("pending_oscall")
+        if not pending:
+            await query.edit_message_text("This call setup expired — ask again.")
+            return
+        code = query.data.rsplit(":", 1)[-1]
+        if code in _CALL_LANG_LABELS and code != pending.get("language"):
+            pending["language"] = code
+            text, kb = _oscall_card(pending)
+            try:
+                await query.edit_message_text(text, reply_markup=kb)
+            except Exception:  # noqa: BLE001 - ignore "message not modified"
+                pass
+        return
+    pending = context.user_data.pop("pending_oscall", None)
+    if query.data != "oscall:yes" or not pending:
+        await query.edit_message_text("Cancelled.")
+        return
+    to = pending["to"]
+    task = pending.get("task") or ""
+    language = pending.get("language", "en")
+    tenant_id = pending.get("tenant_id")
+    await query.edit_message_text(f"Dialing {to}…")
+    out = await dial(to=to, reason=task, language=language, tenant_id=tenant_id)
+    if out.startswith("Error"):
+        await query.message.reply_text(out)
+        return
+    room = out
+    await query.message.reply_text(
+        f"Call placed (room: <code>{html.escape(room)}</code>). Waiting for result…",
+        parse_mode="HTML",
+    )
+    data = await wait_for_result(room)
+    await query.message.reply_text(
+        f"<pre>{html.escape(_format_result(data))}</pre>", parse_mode="HTML",
+    )
+
+
 async def handle_text_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Plain typed message → text reply from the clone. The text counterpart to
     voice_chat_turn: same LLM + memory + shared chat_history, but replies with
     text (voice notes still get voice replies). Registered after the /call
-    ConversationHandler so it doesn't hijack that flow."""
+    ConversationHandler so it doesn't hijack that flow.
+
+    Before chatting, the message is run through a lightweight intent classifier:
+    if it maps to a command (e.g. "translate this clip" → the /translate flow),
+    that handler runs instead of a plain reply. Defaults to chat on any doubt."""
     user = update.effective_user
     msg = update.message
     if not msg or not msg.text:
+        return
+    intent = await _voice_chat.classify_intent(msg.text)
+    if intent != "chat" and await _route_intent(intent, update, context):
         return
     tenant = await _fetch_tenant(user.id) if user else None
     if not tenant:
@@ -790,13 +946,12 @@ async def status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not tenant:
         await update.message.reply_text("Run /register first.")
         return
-    async with aiohttp.ClientSession() as sess:
-        async with sess.get(
-            f"{_bridge_url()}/calls/live",
-            headers=_auth_headers(),
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as r:
-            data = await r.json()
+    try:
+        data = await _bridge_json("GET", "/calls/live")
+    except _BridgeDown as e:
+        log.warning("status: %s", e)
+        await update.message.reply_text("Couldn't reach the bridge to check live calls.")
+        return
     mine = [c for c in (data.get("calls") or []) if c.get("tenant_id") == tenant["id"]]
     if not mine:
         await update.message.reply_text("No calls in flight.")
@@ -852,6 +1007,25 @@ async def _gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     raise ApplicationHandlerStop
 
 
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch-all so one failing handler never silently drops an update.
+
+    Logs the traceback and, when a chat is known, tells the user instead of
+    leaving them with no reply. This is the backstop for the cases a handler
+    doesn't anticipate — e.g. an update with no ``message`` (edited/channel
+    posts), or an unexpected bridge/LLM error.
+    """
+    log.exception("unhandled error in handler", exc_info=context.error)
+    chat = getattr(update, "effective_chat", None)
+    if chat is not None:
+        try:
+            await context.bot.send_message(
+                chat.id, "Something went wrong handling that — please try again."
+            )
+        except Exception:  # noqa: BLE001 - the error handler must never raise
+            pass
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -859,6 +1033,7 @@ def main() -> None:
 
     app = Application.builder().token(token).build()
     app.add_handler(TypeHandler(_Update, _gatekeeper), group=-1)
+    app.add_error_handler(_on_error)
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("call", call_start)],
@@ -885,6 +1060,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.CONTACT, save_contact))
     app.add_handler(CallbackQueryHandler(clone_consent, pattern=r"^clone_consent:"))
     app.add_handler(CallbackQueryHandler(translate_pick_language, pattern=r"^xlate:"))
+    app.add_handler(CallbackQueryHandler(oscall_confirm, pattern=r"^oscall:"))
     app.add_handler(conv)
     # Free-text chat — registered AFTER conv so the /call flow's text steps
     # take precedence while that conversation is active.

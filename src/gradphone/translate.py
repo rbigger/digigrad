@@ -28,12 +28,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import io
 import json
 import logging
 import os
-import struct
-import subprocess
+
+from . import audio_io
 
 log = logging.getLogger(__name__)
 
@@ -110,48 +109,6 @@ def _s2s_url() -> str:
     return f"{base_url}/speech/s2s"
 
 
-def _ffmpeg(args: list[str], stdin: bytes) -> bytes:
-    proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", *args],
-        input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode('utf-8', 'replace')[:300]}")
-    return proc.stdout
-
-
-def _ogg_to_pcm16(audio: bytes, suffix: str = ".ogg") -> bytes:
-    """Any Telegram audio (OGG/Opus, mp3, m4a, wav) → PCM16 mono @ 24 kHz."""
-    return _ffmpeg(
-        ["-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le",
-         "-ac", "1", "-ar", str(IN_SAMPLE_RATE), "pipe:1"],
-        audio,
-    )
-
-
-def _pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
-    """Wrap raw little-endian PCM16 mono in a minimal WAV container."""
-    buf = io.BytesIO()
-    data_len = len(pcm)
-    byte_rate = sample_rate * 2  # mono, 16-bit
-    buf.write(b"RIFF")
-    buf.write(struct.pack("<I", 36 + data_len))
-    buf.write(b"WAVE")
-    buf.write(b"fmt ")
-    buf.write(struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, byte_rate, 2, 16))
-    buf.write(b"data")
-    buf.write(struct.pack("<I", data_len))
-    buf.write(pcm)
-    return buf.getvalue()
-
-
-def _wav_to_ogg_opus(wav: bytes) -> bytes:
-    return _ffmpeg(
-        ["-i", "pipe:0", "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "pipe:1"],
-        wav,
-    )
-
-
 async def _connect(url: str, api_key: str):
     """Open the s2s websocket, tolerating the websockets header-kwarg rename
     (additional_headers in >=14, extra_headers before)."""
@@ -203,7 +160,7 @@ async def translate_voice_note(
             "Clone a voice first or set GRADIUM_TRANSLATE_VOICE_ID."
         )
 
-    pcm_in = await asyncio.to_thread(_ogg_to_pcm16, audio_bytes, suffix)
+    pcm_in = await asyncio.to_thread(audio_io.ogg_to_pcm16, audio_bytes, IN_SAMPLE_RATE)
     if not pcm_in:
         raise RuntimeError("Could not decode any audio from that clip.")
 
@@ -304,6 +261,6 @@ async def translate_voice_note(
         raise RuntimeError(
             "The translation engine returned no audio — try a longer, clearer clip."
         )
-    wav = _pcm16_to_wav(pcm_out, OUT_SAMPLE_RATE)
-    ogg = await asyncio.to_thread(_wav_to_ogg_opus, wav)
+    wav = audio_io.pcm16_to_wav(pcm_out, OUT_SAMPLE_RATE)
+    ogg = await asyncio.to_thread(audio_io.wav_to_ogg_opus, wav)
     return " ".join(text_parts).strip(), ogg

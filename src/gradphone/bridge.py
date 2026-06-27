@@ -1250,9 +1250,7 @@ except Exception as e:  # noqa: BLE001
 # secrets. It must be set deliberately; the mere ABSENCE of a secret never
 # disables auth (that would make every misconfigured fork wide open). When this
 # is off (the default), missing secrets fail CLOSED.
-_ALLOW_INSECURE_LOCAL = os.environ.get("ALLOW_INSECURE_LOCAL", "").strip().lower() in (
-    "1", "true", "yes",
-)
+_ALLOW_INSECURE_LOCAL = _env_flag("ALLOW_INSECURE_LOCAL")
 
 _BRIDGE_API_KEY = os.environ.get("BRIDGE_API_KEY", "").strip()
 if not _BRIDGE_API_KEY:
@@ -1342,6 +1340,29 @@ def _verify_twilio_signature(
     ).digest()
     expected = _b64.b64encode(digest).decode("ascii")
     return hmac.compare_digest(expected, signature)
+
+
+async def _verified_twilio_form(request: fastapi.Request) -> dict:
+    """Parse a Twilio webhook's form params after verifying its signature.
+
+    Reconstructs the signed URL from the x-forwarded headers (Caddy/nginx/the
+    tunnel terminate TLS) and raises 403 if the HMAC doesn't match. Shared by
+    the HTTP webhooks; the WS handshake verifies separately in twilio_stream
+    because Twilio signs the upgrade URL with no body params.
+    """
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.url.netloc
+    signed_url = f"{proto}://{host}{request.url.path}"
+    if request.url.query:
+        signed_url += f"?{request.url.query}"
+    form = await request.form()
+    params = {k: v for k, v in form.multi_items()}
+    if not _verify_twilio_signature(
+        "POST", signed_url, params, request.headers.get("x-twilio-signature", ""),
+    ):
+        log.warning("twilio signature mismatch on %s from %s", request.url.path, request.client)
+        raise fastapi.HTTPException(status_code=403, detail="invalid Twilio signature")
+    return params
 
 
 # --- Routes --------------------------------------------------------------
@@ -1548,20 +1569,7 @@ async def twilio_status(request: fastapi.Request):
     verify and then write a sidecar `twilio_status.json` under the
     recording dir so the result endpoint can fold it into the response.
     """
-    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-    host = request.headers.get("x-forwarded-host") or request.url.netloc
-    signed_url = f"{proto}://{host}{request.url.path}"
-    if request.url.query:
-        signed_url += f"?{request.url.query}"
-    form = await request.form()
-    params = {k: v for k, v in form.multi_items()}
-    if not _verify_twilio_signature(
-        "POST",
-        signed_url,
-        params,
-        request.headers.get("x-twilio-signature", ""),
-    ):
-        raise fastapi.HTTPException(status_code=403, detail="invalid Twilio signature")
+    params = await _verified_twilio_form(request)
 
     room = request.query_params.get("room", "")
     if not room:
@@ -1680,7 +1688,7 @@ def _outbound_destination_allowed(to: str) -> bool:
     (comma-separated E.164) unless ALLOW_ARBITRARY_OUTBOUND=true. With
     neither set, every destination is refused — attendees must not be able
     to dial arbitrary numbers in a cloned voice."""
-    if os.environ.get("ALLOW_ARBITRARY_OUTBOUND", "").strip().lower() in ("1", "true", "yes"):
+    if _env_flag("ALLOW_ARBITRARY_OUTBOUND"):
         return True
     allowlist = {
         "+" + "".join(ch for ch in n if ch.isdigit())
@@ -1835,23 +1843,8 @@ async def twilio_voice(request: fastapi.Request):
     `start.customParameters.room`.
     """
     # Verify Twilio's signature so the public TwiML endpoint can't be
-    # poked by random clients on the internet. Reconstruct the signed
-    # URL from x-forwarded headers (Caddy/nginx terminate TLS).
-    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-    host = request.headers.get("x-forwarded-host") or request.url.netloc
-    signed_url = f"{proto}://{host}{request.url.path}"
-    if request.url.query:
-        signed_url += f"?{request.url.query}"
-    form = await request.form()
-    params = {k: v for k, v in form.multi_items()}
-    if not _verify_twilio_signature(
-        "POST",
-        signed_url,
-        params,
-        request.headers.get("x-twilio-signature", ""),
-    ):
-        log.warning("twilio_voice: signature mismatch from %s", request.client)
-        raise fastapi.HTTPException(status_code=403, detail="invalid Twilio signature")
+    # poked by random clients on the internet.
+    params = await _verified_twilio_form(request)
     room = request.query_params.get("room", "")
 
     # Inbound branch — no room means Twilio is routing an INCOMING call to us
@@ -1859,7 +1852,7 @@ async def twilio_voice(request: fastapi.Request):
     # the line isn't live by accident. When on, mint receptionist state and
     # answer; when off, politely decline.
     if not room:
-        if os.environ.get("ENABLE_INBOUND", "").strip().lower() not in ("1", "true", "yes"):
+        if not _env_flag("ENABLE_INBOUND"):
             log.info("inbound call rejected (ENABLE_INBOUND off) from %s", params.get("From"))
             return PlainTextResponse(
                 '<?xml version="1.0" encoding="UTF-8"?>'
@@ -2023,11 +2016,19 @@ async def twilio_stream(websocket: fastapi.WebSocket):
         )
     except Exception:
         # If gradbot.run() itself raises (e.g. STT slot still wasn't
-        # free even after the semaphore), release the slot so the next
-        # caller can claim it. The semaphore release inside the call's
-        # finally only runs on the success path.
+        # free even after the semaphore), nothing below runs — so the
+        # call's own try/finally never takes over. Release everything we
+        # acquired/opened above (semaphore, live-registry entry, WAV
+        # handles, the Twilio WS) here, or the failed call leaks a
+        # concurrency slot and shows up forever in /calls/live.
         if _GRADBOT_SEMAPHORE is not None:
             _GRADBOT_SEMAPHORE.release()
+        _close_wav(state.wav_caller)
+        _close_wav(state.wav_agent)
+        async with _PENDING_LOCK:
+            _ACTIVE.pop(room, None)
+            _ACTIVE.pop(state.room_name, None)
+        await _safe_close(websocket)
         raise
 
     stop_event = asyncio.Event()
